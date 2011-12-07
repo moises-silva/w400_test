@@ -13,6 +13,10 @@
 #define AFT_CORE_REV_SHIFT 8
 #define AFT_CORE_REV(id) ((id >> AFT_CORE_REV_SHIFT) & 0xFF)
 
+#define AFT_W400_FPGA_GLOBAL_REG 0x1040
+#define AFT_W400_FPGA_SFR_EX_BIT 1
+#define AFT_W400_FPGA_SFR_IN_BIT 2
+
 #define W400_PCI_MEM_SIZE 0x0FFFF
 
 #define AFT_W400_GLOBAL_REG 0x1400
@@ -25,6 +29,8 @@
 #define AFT_W400_GLOBAL_SHUTDOWN_BIT 31
 
 #define aft_test_bit(a,b) test_bit((a), (unsigned long *)(b))
+#define aft_set_bit(a,b) set_bit((a), (unsigned long *)(b))
+#define aft_clear_bit(a,b) clear_bit((a), (unsigned long *)(b))
 
 typedef struct w400_dev {
 	struct pci_dev *pci_dev;
@@ -36,11 +42,14 @@ typedef struct w400_dev {
 static w400_dev_t w400_devices[MAX_DEVICES];
 static int w400_count = 0;
 
-static void dump_w400_status(w400_dev_t *dev)
+#define w400_read_reg(dev, reg) readl(((dev)->mapped_memory + reg));
+#define w400_write_reg(dev, reg, data) writel(data, ((dev)->mapped_memory + reg));
+
+static void w400_dump_status(w400_dev_t *dev)
 {
 	u32 reg = 0;
 	/* try to read the global W400 reg */
-	reg = readl((dev->mapped_memory + AFT_W400_GLOBAL_REG));
+	reg = w400_read_reg(dev, AFT_W400_GLOBAL_REG);
 	printk(KERN_INFO "W400 global reg: %X\n", reg);
 	printk(KERN_INFO "W400 PLL reset: %d\n", aft_test_bit(AFT_W400_PLL_RESET_BIT, &reg));
 	printk(KERN_INFO "W400 PLL Phase Shift Overflow: %d\n", aft_test_bit(AFT_W400_PLL_PHASE_SHIFT_OVERFLOW_BIT, &reg));
@@ -49,6 +58,42 @@ static void dump_w400_status(w400_dev_t *dev)
 	printk(KERN_INFO "W400 PLL Locked: %d\n", aft_test_bit(AFT_W400_PLL_LOCKED_BIT, &reg));
 	printk(KERN_INFO "W400 SIM Muxing Errror: %d\n", aft_test_bit(AFT_W400_SIM_MUXING_ERROR_BIT, &reg));
 	printk(KERN_INFO "W400 Global Shutdown: %d\n", aft_test_bit(AFT_W400_GLOBAL_SHUTDOWN_BIT, &reg));
+}
+
+static void w400_reset_fpga(w400_dev_t *dev)
+{
+	u32 reg = 0;
+	//reg = w400_read_reg(dev, AFT_W400_GLOBAL_REG);
+	aft_set_bit(AFT_W400_FPGA_SFR_EX_BIT, &reg);
+	aft_set_bit(AFT_W400_FPGA_SFR_IN_BIT, &reg);
+	w400_write_reg(dev, AFT_W400_FPGA_GLOBAL_REG, reg);
+	udelay(10);
+
+	aft_clear_bit(AFT_W400_FPGA_SFR_EX_BIT, &reg);
+	aft_clear_bit(AFT_W400_FPGA_SFR_IN_BIT, &reg);
+	w400_write_reg(dev, AFT_W400_FPGA_GLOBAL_REG, reg);
+	udelay(10);
+}
+
+static void w400_reset_uart(w400_dev_t *dev)
+{
+	u32 reg = 0;
+	reg = w400_read_reg(dev, AFT_W400_GLOBAL_REG);
+	aft_set_bit(AFT_W400_PLL_RESET_BIT, &reg);
+	w400_write_reg(dev, AFT_W400_GLOBAL_REG, reg);
+	udelay(10);
+	aft_clear_bit(AFT_W400_PLL_RESET_BIT, &reg);
+	w400_write_reg(dev, AFT_W400_GLOBAL_REG, reg);
+	udelay(10);
+}
+
+static void w400_restore_uart(w400_dev_t *dev)
+{
+	u32 reg = 0;
+	reg = w400_read_reg(dev, AFT_W400_GLOBAL_REG);
+	aft_set_bit(AFT_W400_PLL_RESET_BIT, &reg);
+	w400_write_reg(dev, AFT_W400_GLOBAL_REG, reg);
+	udelay(10);
 }
 
 int init_module(void)
@@ -96,17 +141,26 @@ int init_module(void)
 			mapped_memory = ioremap(pci_base_addr, W400_PCI_MEM_SIZE);
 			printk(KERN_INFO "physical memory %p mapped into virtual memory %p\n", (void *)pci_base_addr, mapped_memory);
 
-			pci_set_master(pci_dev);
+			if (mapped_memory) {
+				pci_set_master(pci_dev);
 
-			w400_devices[i].pci_dev = pci_dev;
-			w400_devices[i].pci_base_addr = pci_base_addr;
-			w400_devices[i].mapped_memory = mapped_memory;
+				w400_devices[i].pci_dev = pci_dev;
+				w400_devices[i].pci_base_addr = pci_base_addr;
+				w400_devices[i].mapped_memory = mapped_memory;
+
+				w400_reset_fpga(&w400_devices[i]);
+
+				w400_dump_status(&w400_devices[i]);
+
+				/* try to reset the uart */
+				w400_reset_uart(&w400_devices[i]);
+
+				mdelay(1000);
+
+				w400_dump_status(&w400_devices[i]);
+			}
+
 			printk(KERN_INFO "Created W400 %p\n", w400_devices[i].pci_dev);
-
-			dump_w400_status(&w400_devices[i]);
-
-			/* try to reset the uart */
-			udelay(10);
 			i++;
 		}
 	}
@@ -122,10 +176,14 @@ void cleanup_module(void)
 		if (!w400_devices[i].pci_dev) {
 			break;
 		}
+
 		printk(KERN_INFO "Destroying W400 %p\n", w400_devices[i].pci_dev);
+
 		if (w400_devices[i].mapped_memory) {
+			w400_restore_uart(&w400_devices[i]);
 			iounmap(w400_devices[i].mapped_memory);
 		}
+
 		pci_release_region(w400_devices[i].pci_dev, 0);
 	}
 	memset(w400_devices, 0, sizeof(w400_devices));
