@@ -19,6 +19,15 @@
 
 #define W400_PCI_MEM_SIZE 0x0FFFF
 
+/* Starting configuration register (incremented by AFT_GSM_REG_OFFSET for each module) */
+#define AFT_W400_CONFIG_REG 0x1200
+
+/* Per module register offset */
+#define AFT_W400_REG_OFFSET 0x0004
+
+/*!< Retrieve the register address for a module */
+#define AFT_W400_MOD_REG(mod_no, reg) (reg + ((mod_no-1) * AFT_W400_REG_OFFSET))
+
 #define AFT_W400_GLOBAL_REG 0x1400
 #define AFT_W400_PLL_RESET_BIT 0
 #define AFT_W400_PLL_PHASE_SHIFT_OVERFLOW_BIT 1
@@ -32,18 +41,65 @@
 #define aft_set_bit(a,b) set_bit((a), (unsigned long *)(b))
 #define aft_clear_bit(a,b) clear_bit((a), (unsigned long *)(b))
 
+#define MAX_DEVICES 10 
+#define MAX_W400_MODULES 4
+/* All modules masked (4 modules, 1111) */
+#define W400_ALL_MODULES_MASK 0x000F
+#define MOD_BIT(mod_no) (mod_no - 1)
+
+#define w400_read_reg(dev, reg) readl(((dev)->mapped_memory + reg));
+#define w400_write_reg(dev, reg, data) writel(data, ((dev)->mapped_memory + reg));
+
+/*!< W400 module configuration (bit numbers are zero-based) */
+#define AFT_W400_MOD_POWER_BIT 0x0
+#define AFT_W400_MOD_RESET_BIT 0x1
+#define AFT_W400_MOD_POWER_MONITOR_BIT 0x2
+#define AFT_W400_MOD_TX_MONITOR_BIT 0x3
+#define AFT_W400_MOD_SIM_INSERTED_BIT 0x4
+
+/*!< The high order last 3 bits of first byte of the module configuration register select the SIM */
+#define AFT_W400_MOD_SIM_BIT_OFFSET 5
+#define AFT_W400_MOD_SIM_MASK (0x7 << AFT_W400_MOD_SIM_BIT_OFFSET)
+
+/*!< The first 3 bits of the second byte select the UART baud rate */
+#define AFT_W400_MOD_UART_BAUD_RATE_BIT_OFFSET 0x8
+#define AFT_W400_MOD_UART_BAUD_RATE_MASK (0x7 << AFT_W400_MOD_UART_BAUD_RATE_BIT_OFFSET)
+
+/*!< The fourth bit of the second byte report if there is service or not */
+#define AFT_W400_MOD_SERVICE_BIT 0xB
+
+/*!< The fifth bit of the second byte report if there is a module (cell phone) present or not */
+#define AFT_W400_MOD_PRESENT_BIT 0xC
+
+/*! Absolute timeout to power on/off a module 
+ *  Telit data sheet suggests 2 seconds, but once in a while
+ *  the fourth module in W400 takes ~4 seconds to stop ... lets be safe and do 8 seconds
+ */
+#define AFT_W400_MODULE_POWER_TOGGLE_TIMEOUT_MS 8000
+
+/*!< How often to check if the module is already on/off during startup/shutdown */
+#define AFT_W400_MODULE_POWER_TOGGLE_CHECK_INTERVAL_MS 10
+
+/*! Absolute timeout to enable PLL */
+#define AFT_W400_PLL_ENABLE_TIMEOUT_MS 2000
+
+/*!< How often to check if the PLL is already enabled on startup */
+#define AFT_W400_PLL_ENABLE_CHECK_INTERVAL_MS 100
+
+/*! How much to wait between power registry writes 
+ *  Telit data sheet says input command for switch off/on must be equal or bigger to 1 second let's use 2 seconds to be safe
+ */
+#define AFT_W400_MODULE_POWER_TOGGLE_DELAY_MS 2000
+
 typedef struct w400_dev {
 	struct pci_dev *pci_dev;
 	unsigned long pci_base_addr;
 	void *mapped_memory;
+	int powered_modules_map;
 } w400_dev_t;
 
-#define MAX_DEVICES 10 
 static w400_dev_t w400_devices[MAX_DEVICES];
 static int w400_count = 0;
-
-#define w400_read_reg(dev, reg) readl(((dev)->mapped_memory + reg));
-#define w400_write_reg(dev, reg, data) writel(data, ((dev)->mapped_memory + reg));
 
 static void w400_dump_status(w400_dev_t *dev)
 {
@@ -94,6 +150,89 @@ static void w400_restore_uart(w400_dev_t *dev)
 	aft_set_bit(AFT_W400_PLL_RESET_BIT, &reg);
 	w400_write_reg(dev, AFT_W400_GLOBAL_REG, reg);
 	udelay(10);
+}
+
+int w400_toggle_power(w400_dev_t *dev, int mod_map, int turn_on)
+{
+	u32 reg[MAX_W400_MODULES+1]; /* mod_no is not zero-based */
+	int timeout_loops = 0;
+	int mod_no = 1;
+
+	/* 
+	 * Power toggle sequence as described by the Telit documentation
+	 * We have a power monitor pin that tells us whether the module is on/off
+	 * We have a power pin that is equivalent to the power on/off button on your cell phone
+	 * In order to turn on/off we hold high the power pin for at least one second and then
+	 * set it low. Then we monitor the power monitor pin until goes high/low depending on
+	 * whether we're turning on or off the module
+	 * 
+	 * Note that in the Telit documentation you will see the high/low order inversed, there
+	 * is an inversor in our hardware doing that, ask our hw engineers why? :-)
+	 */
+
+	for (mod_no = 1; mod_no <= MAX_W400_MODULES; mod_no++) {
+		if (!aft_test_bit(MOD_BIT(mod_no), &mod_map)) {
+			continue;
+		}
+		printk(KERN_INFO "Turning W400 module %d %s ...\n", mod_no, turn_on ? "on" : "off");
+		reg[mod_no] = w400_read_reg(dev, AFT_W400_MOD_REG(mod_no, AFT_W400_CONFIG_REG));
+		if (turn_on && aft_test_bit(AFT_W400_MOD_POWER_MONITOR_BIT, &reg[mod_no])) {
+			printk(KERN_INFO "W400 module %d is already %s ...\n", mod_no, "on");
+			aft_clear_bit(MOD_BIT(mod_no), &mod_map);
+			continue;
+		}
+		if (!turn_on && !aft_test_bit(AFT_W400_MOD_POWER_MONITOR_BIT, &reg[mod_no])) {
+			printk(KERN_INFO "W400 module %d is already %s ...\n", mod_no, "off");
+			aft_clear_bit(MOD_BIT(mod_no), &mod_map);
+			continue;
+		}
+		aft_set_bit(AFT_W400_MOD_POWER_BIT, &reg[mod_no]);
+		w400_write_reg(dev, AFT_W400_MOD_REG(mod_no, AFT_W400_CONFIG_REG), reg[mod_no]);
+	}
+
+	mdelay(AFT_W400_MODULE_POWER_TOGGLE_DELAY_MS);
+
+	for (mod_no = 1; mod_no <= MAX_W400_MODULES; mod_no++) {
+		if (!aft_test_bit(MOD_BIT(mod_no), &mod_map)) {
+			continue;
+		}
+		aft_clear_bit(AFT_W400_MOD_POWER_BIT, &reg[mod_no]);
+		w400_write_reg(dev, AFT_W400_MOD_REG(mod_no, AFT_W400_CONFIG_REG), reg[mod_no]);
+	}
+
+	for (timeout_loops = (AFT_W400_MODULE_POWER_TOGGLE_TIMEOUT_MS / AFT_W400_MODULE_POWER_TOGGLE_CHECK_INTERVAL_MS); 
+	     (timeout_loops && mod_map); 
+	     timeout_loops--) {
+		mdelay(AFT_W400_MODULE_POWER_TOGGLE_CHECK_INTERVAL_MS);
+		for (mod_no = 1; mod_no <= MAX_W400_MODULES; mod_no++) {
+			if (!aft_test_bit(MOD_BIT(mod_no), &mod_map)) {
+				continue;
+			}
+			reg[mod_no] = w400_read_reg(dev, AFT_W400_MOD_REG(mod_no, AFT_W400_CONFIG_REG));
+			/* if we were asked to turn the module on and is on, we're done */
+			if (turn_on && aft_test_bit(AFT_W400_MOD_POWER_MONITOR_BIT, &reg[mod_no])) {
+				printk(KERN_INFO "W400 module %d is now %s ...\n", mod_no, "on");
+				aft_clear_bit(MOD_BIT(mod_no), &mod_map);
+				aft_set_bit(MOD_BIT(mod_no), &dev->powered_modules_map);
+			}
+			/* if we were asked to turn the module off and is off, we're done */
+			if (!turn_on && !aft_test_bit(AFT_W400_MOD_POWER_MONITOR_BIT, &reg[mod_no])) {
+				printk(KERN_INFO "W400 module %d is now %s ...\n", mod_no, "off");
+				aft_clear_bit(MOD_BIT(mod_no), &mod_map);
+				aft_clear_bit(MOD_BIT(mod_no), &dev->powered_modules_map);
+			}
+		}
+	}
+	return mod_map;
+}
+static void w400_power_on_modules(w400_dev_t *dev)
+{
+	w400_toggle_power(dev, W400_ALL_MODULES_MASK, 1);
+}
+
+static void w400_power_off_modules(w400_dev_t *dev)
+{
+	w400_toggle_power(dev, W400_ALL_MODULES_MASK, 0);
 }
 
 int init_module(void)
@@ -152,10 +291,15 @@ int init_module(void)
 
 				w400_dump_status(&w400_devices[i]);
 
+				mdelay(1000);
+
 				/* try to reset the uart */
 				w400_reset_uart(&w400_devices[i]);
 
 				mdelay(1000);
+
+				/* try to power on all the modules */
+				w400_power_on_modules(&w400_devices[i]);
 
 				w400_dump_status(&w400_devices[i]);
 			}
@@ -180,6 +324,7 @@ void cleanup_module(void)
 		printk(KERN_INFO "Destroying W400 %p\n", w400_devices[i].pci_dev);
 
 		if (w400_devices[i].mapped_memory) {
+			w400_power_off_modules(&w400_devices[i]);
 			w400_restore_uart(&w400_devices[i]);
 			iounmap(w400_devices[i].mapped_memory);
 		}
