@@ -2,6 +2,7 @@
 #include <linux/kernel.h>	/* Needed for KERN_INFO */
 #include <linux/pci.h>	        /* Needed for pci functions */
 #include <linux/init.h>	        /* Needed for __init and __exit macros */
+#include <linux/delay.h>	        /* Needed for delay macros */
 
 #define DRIVER_AUTHOR "Moises Silva <moy@sangoma.com>"
 #define DRIVER_DESC "W400 test driver"
